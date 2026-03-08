@@ -1,0 +1,41 @@
+[package]
+name = "navi-agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+navi-llm = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing-appender = { workspace = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+chrono = { workspace = true, features = ["serde"] }
+futures-util.workspace = true
+thiserror = { workspace = true }
+uuid = { workspace = true, features = [
+    "v4",
+    "fast-rng",
+    "macro-diagnostics",
+    "serde",
+] }
+tokio-util = { workspace = true, features = ["full"] }
+async-stream = "0.3.6"
+regex = "1.10"
+reqwest = { workspace = true, features = ["json", "stream"] }
+eventsource-stream = "0.2.3"
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+rustyline = "14.0"
+ignore = "0.4.25"
+
+[dev-dependencies]
+
+[features]
+default = []
+local-llm = ["dep:navi-llm"]
