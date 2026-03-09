@@ -1,12 +1,15 @@
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::control::{AgentControlMessage, ControlSender, CONTROL_CHANNEL_BUFFER};
 use crate::context::pipeline::ContextPipeline;
 use crate::context::store::ContextStore;
 use crate::core::error::AgentError;
 use crate::runtime::llm_client::LlmClient;
 use crate::runtime::loop_impl::{agent_loop, AgentLoopConfig};
 use crate::runtime::stream::AgentEventStream;
+use crate::tool::middleware::ToolMiddleware;
 use crate::tool::registry::ToolRegistry;
 
 /// `NaviAgent` is the primary high-level interface for interacting with the agent framework.
@@ -20,7 +23,9 @@ pub struct NaviAgent {
     tool_registry: Arc<ToolRegistry>,
     context_pipeline: Arc<ContextPipeline>,
     pub(crate) context_store: Arc<dyn ContextStore>,
+    middlewares: Vec<Arc<dyn ToolMiddleware>>,
     cancel: Option<CancellationToken>,
+    control_tx: Option<ControlSender>,
 }
 
 impl NaviAgent {
@@ -31,6 +36,7 @@ impl NaviAgent {
         tool_registry: Arc<ToolRegistry>,
         context_pipeline: Arc<ContextPipeline>,
         context_store: Arc<dyn ContextStore>,
+        middlewares: Vec<Arc<dyn ToolMiddleware>>,
     ) -> Self {
         Self {
             config,
@@ -38,7 +44,9 @@ impl NaviAgent {
             tool_registry,
             context_pipeline,
             context_store,
+            middlewares,
             cancel: None,
+            control_tx: None,
         }
     }
 
@@ -50,14 +58,19 @@ impl NaviAgent {
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
 
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_BUFFER);
+        self.control_tx = Some(control_tx);
+
         agent_loop(
             self.config.clone(),
             self.llm_client.clone(),
             self.tool_registry.clone(),
             self.context_pipeline.clone(),
             self.context_store.clone(),
+            self.middlewares.clone(),
             input.into(),
             cancel,
+            Some(control_rx),
         )
     }
 
@@ -69,18 +82,65 @@ impl NaviAgent {
     ) -> AgentEventStream {
         self.cancel = Some(cancel.clone());
 
+        let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_BUFFER);
+        self.control_tx = Some(control_tx);
+
         agent_loop(
             self.config.clone(),
             self.llm_client.clone(),
             self.tool_registry.clone(),
             self.context_pipeline.clone(),
             self.context_store.clone(),
+            self.middlewares.clone(),
             input.into(),
             cancel,
+            Some(control_rx),
         )
     }
 
-    /// Cancel the current running agent loop.
+    /// Send a steering message to the running agent.
+    ///
+    /// The agent will finish executing its current tool, skip any remaining
+    /// tool calls in this turn, and start a new turn with this message as
+    /// user input.
+    ///
+    /// Returns `Ok(())` if the message was sent, or `Err` if no agent loop
+    /// is currently running.
+    pub async fn steer(&self, msg: impl Into<String>) -> Result<(), AgentError> {
+        if let Some(tx) = &self.control_tx {
+            tx.send(AgentControlMessage::Steer(msg.into()))
+                .await
+                .map_err(|_| {
+                    AgentError::Other(anyhow::anyhow!(
+                        "Failed to send steer message: agent loop not running"
+                    ))
+                })
+        } else {
+            Err(AgentError::Other(anyhow::anyhow!(
+                "No agent loop is currently running"
+            )))
+        }
+    }
+
+    /// Gracefully cancel the running agent. The agent will finish its current
+    /// tool execution and then stop, preserving partial results.
+    pub async fn graceful_cancel(&self) -> Result<(), AgentError> {
+        if let Some(tx) = &self.control_tx {
+            tx.send(AgentControlMessage::Cancel)
+                .await
+                .map_err(|_| {
+                    AgentError::Other(anyhow::anyhow!(
+                        "Failed to send cancel message: agent loop not running"
+                    ))
+                })
+        } else {
+            Err(AgentError::Other(anyhow::anyhow!(
+                "No agent loop is currently running"
+            )))
+        }
+    }
+
+    /// Cancel the current running agent loop immediately via CancellationToken.
     pub fn abort(&self) {
         if let Some(cancel) = &self.cancel {
             cancel.cancel();

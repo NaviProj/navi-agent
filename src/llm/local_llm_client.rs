@@ -24,6 +24,9 @@ pub struct LocalLlmAgentClient {
     factory: Arc<LlmSessionFactory>,
     enable_thinking: bool,
     caller_managed_context: bool,
+    /// Optional overrides for session creation (allows sharing a factory with different session params)
+    ctx_size_override: Option<u32>,
+    max_tokens_override: Option<u32>,
 }
 
 #[derive(Default)]
@@ -48,6 +51,8 @@ impl LocalLlmAgentClient {
             factory,
             enable_thinking,
             caller_managed_context,
+            ctx_size_override: None,
+            max_tokens_override: None,
         })
     }
 
@@ -60,6 +65,28 @@ impl LocalLlmAgentClient {
             factory,
             enable_thinking,
             caller_managed_context,
+            ctx_size_override: None,
+            max_tokens_override: None,
+        }
+    }
+
+    /// Create from a shared factory with custom session parameters.
+    ///
+    /// This allows reusing a loaded model while overriding ctx_size and max_tokens
+    /// for sessions created by this client.
+    pub fn from_factory_with_options(
+        factory: Arc<LlmSessionFactory>,
+        enable_thinking: bool,
+        caller_managed_context: bool,
+        ctx_size: Option<u32>,
+        max_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            factory,
+            enable_thinking,
+            caller_managed_context,
+            ctx_size_override: ctx_size,
+            max_tokens_override: max_tokens,
         }
     }
 }
@@ -174,6 +201,8 @@ impl LlmClient for LocalLlmAgentClient {
         let factory = self.factory.clone();
         let enable_thinking = self.enable_thinking;
         let caller_managed_context = self.caller_managed_context;
+        let ctx_size_override = self.ctx_size_override;
+        let max_tokens_override = self.max_tokens_override;
 
         let mut chat_history = Vec::new();
         for msg in messages {
@@ -192,9 +221,11 @@ impl LlmClient for LocalLlmAgentClient {
 
         tokio::task::spawn_blocking(move || {
             let cfg = factory.config();
+            let ctx_size = ctx_size_override.unwrap_or(cfg.ctx_size.get());
+            let max_tokens = max_tokens_override.unwrap_or(cfg.max_tokens);
             let mut session = match factory.create_session_with_options(
-                Some(cfg.ctx_size.get()),
-                Some(cfg.max_tokens),
+                Some(ctx_size),
+                Some(max_tokens),
             ) {
                 Ok(s) => s,
                 Err(e) => {

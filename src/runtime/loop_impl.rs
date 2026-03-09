@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
+use crate::agent::control::ControlReceiver;
 use crate::context::pipeline::ContextPipeline;
 use crate::context::store::ContextStore;
 use crate::core::error::AgentError;
@@ -10,7 +11,8 @@ use crate::core::event::{AgentEvent, MessageDelta};
 use crate::core::message::{ContentBlock, LLMMessage, MessageRole, NaviMessage};
 use crate::runtime::llm_client::LlmClient;
 use crate::runtime::stream::AgentEventStream;
-use crate::tool::executor::ToolExecutor;
+use crate::tool::executor::{ExecutionOutcome, ToolExecutor};
+use crate::tool::middleware::ToolMiddleware;
 use crate::tool::registry::ToolRegistry;
 
 use futures_util::StreamExt;
@@ -44,6 +46,7 @@ impl Default for AgentLoopConfig {
 /// - A context pipeline for pre-processing messages
 /// - An initial set of messages (conversation history)
 /// - A user input message
+/// - An optional control channel for steering/graceful cancellation
 ///
 /// It returns an `AgentEventStream` that the caller can consume for real-time events.
 /// The actual loop runs in a background tokio task.
@@ -53,8 +56,10 @@ pub fn agent_loop(
     tool_registry: Arc<ToolRegistry>,
     context_pipeline: Arc<ContextPipeline>,
     context_store: Arc<dyn ContextStore>,
+    middlewares: Vec<Arc<dyn ToolMiddleware>>,
     user_input: String,
     cancel: CancellationToken,
+    control_rx: Option<ControlReceiver>,
 ) -> AgentEventStream {
     let (event_tx, event_rx) = mpsc::channel(config.event_buffer_size);
     let stream = AgentEventStream::new(event_rx);
@@ -66,9 +71,11 @@ pub fn agent_loop(
             tool_registry,
             context_pipeline,
             context_store,
+            middlewares,
             user_input,
             cancel,
             event_tx.clone(),
+            control_rx,
         )
         .await;
 
@@ -87,11 +94,13 @@ async fn run_loop(
     tool_registry: Arc<ToolRegistry>,
     context_pipeline: Arc<ContextPipeline>,
     context_store: Arc<dyn ContextStore>,
+    middlewares: Vec<Arc<dyn ToolMiddleware>>,
     user_input: String,
     cancel: CancellationToken,
     event_tx: mpsc::Sender<AgentEvent>,
+    mut control_rx: Option<ControlReceiver>,
 ) -> Result<(), AgentError> {
-    let tool_executor = ToolExecutor::new(tool_registry.clone());
+    let tool_executor = ToolExecutor::with_middlewares(tool_registry.clone(), middlewares);
 
     // Load history and build message list
     let mut messages = context_store.load_messages().await?;
@@ -265,23 +274,77 @@ async fn run_loop(
         if !tool_calls.is_empty() {
             info!(count = tool_calls.len(), "Executing tool calls");
 
-            let tool_results = tool_executor
-                .execute_tool_calls(tool_calls, cancel.clone(), &event_tx)
+            let outcome = tool_executor
+                .execute_tool_calls(tool_calls, cancel.clone(), &event_tx, &mut control_rx)
                 .await?;
 
-            // Emit TurnEnd
-            let _ = event_tx
-                .send(AgentEvent::TurnEnd {
-                    message: assistant_msg,
-                    tool_results: tool_results.clone(),
-                })
-                .await;
+            match outcome {
+                ExecutionOutcome::Completed(tool_results) => {
+                    // Emit TurnEnd
+                    let _ = event_tx
+                        .send(AgentEvent::TurnEnd {
+                            message: assistant_msg,
+                            tool_results: tool_results.clone(),
+                        })
+                        .await;
 
-            // Add tool results to message history for next turn
-            messages.extend(tool_results);
+                    // Add tool results to message history for next turn
+                    messages.extend(tool_results);
 
-            // Continue to next turn — LLM needs to see tool results
-            continue;
+                    // Continue to next turn — LLM needs to see tool results
+                    continue;
+                }
+                ExecutionOutcome::Steered {
+                    results: tool_results,
+                    message: steer_msg,
+                } => {
+                    info!("Agent steered with new message, starting new turn");
+
+                    // Emit TurnEnd with partial results
+                    let _ = event_tx
+                        .send(AgentEvent::TurnEnd {
+                            message: assistant_msg,
+                            tool_results: tool_results.clone(),
+                        })
+                        .await;
+
+                    // Emit Steered event so consumers know the agent was redirected
+                    let _ = event_tx
+                        .send(AgentEvent::Steered {
+                            message: steer_msg.clone(),
+                        })
+                        .await;
+
+                    // Add partial tool results + steering user message
+                    messages.extend(tool_results);
+                    messages.push(NaviMessage::new_user_text(&steer_msg));
+
+                    // Continue to next turn with the steering message
+                    continue;
+                }
+                ExecutionOutcome::Cancelled(tool_results) => {
+                    info!("Agent gracefully cancelled after tool execution");
+
+                    // Emit TurnEnd with partial results
+                    let _ = event_tx
+                        .send(AgentEvent::TurnEnd {
+                            message: assistant_msg,
+                            tool_results: tool_results.clone(),
+                        })
+                        .await;
+
+                    // Emit GracefullyCancelled event
+                    let _ = event_tx
+                        .send(AgentEvent::GracefullyCancelled)
+                        .await;
+
+                    // Add partial tool results
+                    messages.extend(tool_results);
+
+                    // Break out — graceful cancel
+                    break;
+                }
+            }
         }
 
         // No tool calls — this is the final response

@@ -45,6 +45,14 @@ pub enum AgentEvent {
         is_error: bool,
     },
 
+    // Control
+    /// Emitted when the agent is steered with a new user message mid-execution.
+    Steered {
+        message: String,
+    },
+    /// Emitted when the agent is gracefully cancelled (not aborted).
+    GracefullyCancelled,
+
     // Error
     Error(String),
 }

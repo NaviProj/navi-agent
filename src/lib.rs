@@ -32,10 +32,10 @@ pub use context::{ContextPipeline, ContextTransform, MessageBasedPruner};
 
 // Agent
 pub use agent::compat::NaviBotLlmClient;
-pub use agent::{AgentBuilder, NaviAgent};
+pub use agent::{AgentBuilder, AgentControlMessage, NaviAgent};
 
 // Tool
-pub use tool::{NaviTool, ToolRegistry, ToolResult};
+pub use tool::{NaviTool, OutputTruncationMiddleware, ToolMiddleware, ToolRegistry, ToolResult};
 
 // Schedule NaviTools
 pub use agents::schedule_tools::{

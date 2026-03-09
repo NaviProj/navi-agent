@@ -6,6 +6,7 @@ use crate::context::store::{ContextStore, InMemoryContextStore};
 use crate::context::ContextTransform;
 use crate::runtime::llm_client::LlmClient;
 use crate::runtime::loop_impl::AgentLoopConfig;
+use crate::tool::middleware::ToolMiddleware;
 use crate::tool::registry::ToolRegistry;
 use crate::tool::traits::NaviTool;
 
@@ -17,6 +18,7 @@ use crate::tool::traits::NaviTool;
 ///     .system_prompt("You are a helpful assistant.")
 ///     .max_turns(5)
 ///     .tool(my_tool)
+///     .tool_middleware(OutputTruncationMiddleware::new(4000))
 ///     .context_transform(my_pruner)
 ///     .build();
 /// ```
@@ -26,6 +28,7 @@ pub struct AgentBuilder {
     registry: ToolRegistry,
     pipeline: ContextPipeline,
     context_store: Arc<dyn ContextStore>,
+    middlewares: Vec<Arc<dyn ToolMiddleware>>,
 }
 
 impl AgentBuilder {
@@ -37,6 +40,7 @@ impl AgentBuilder {
             registry: ToolRegistry::new(),
             pipeline: ContextPipeline::new(),
             context_store: Arc::new(InMemoryContextStore::new()),
+            middlewares: Vec::new(),
         }
     }
 
@@ -59,8 +63,14 @@ impl AgentBuilder {
     }
 
     /// Register a tool.
-    pub fn tool(mut self, tool: impl NaviTool + 'static) -> Self {
+    pub fn tool(self, tool: impl NaviTool + 'static) -> Self {
         self.registry.register(tool);
+        self
+    }
+
+    /// Add a tool middleware to the execution pipeline.
+    pub fn tool_middleware(mut self, middleware: impl ToolMiddleware + 'static) -> Self {
+        self.middlewares.push(Arc::new(middleware));
         self
     }
 
@@ -84,6 +94,7 @@ impl AgentBuilder {
             Arc::new(self.registry),
             Arc::new(self.pipeline),
             self.context_store,
+            self.middlewares,
         )
     }
 }

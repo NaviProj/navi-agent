@@ -6,3 +6,4 @@ pub mod control;
 pub use agent_impl::NaviAgent;
 pub use builder::AgentBuilder;
 pub use compat::NaviBotLlmClient;
+pub use control::{AgentControlMessage, ControlReceiver, ControlSender};

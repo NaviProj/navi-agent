@@ -4,33 +4,27 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-
-anyhow = { workspace = true }
-async-trait = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-navi-llm = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
-tracing-appender = { workspace = true }
-rusqlite = { version = "0.31", features = ["bundled"] }
-chrono = { workspace = true, features = ["serde"] }
-futures-util.workspace = true
-thiserror = { workspace = true }
-uuid = { workspace = true, features = [
-    "v4",
-    "fast-rng",
-    "macro-diagnostics",
-    "serde",
-] }
-tokio-util = { workspace = true, features = ["full"] }
+anyhow = "1.0"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.41", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+navi-llm = { path = "../navi-llm", optional = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+thiserror = "1.0"
+uuid = { version = "1.11", features = ["v4", "fast-rng", "macro-diagnostics", "serde"] }
+tokio-util = { version = "0.7", features = ["full"] }
 async-stream = "0.3.6"
 regex = "1.10"
-reqwest = { workspace = true, features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 eventsource-stream = "0.2.3"
-base64 = { workspace = true }
-clap = { workspace = true, features = ["derive", "env"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive", "env"] }
 rustyline = "14.0"
 ignore = "0.4.25"
 
