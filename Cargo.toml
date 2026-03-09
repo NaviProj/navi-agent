@@ -12,7 +12,7 @@ tokio = { version = "1.41", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-navi-llm = { path = "../navi-llm", optional = true }
+navi-llm = { git = "https://github.com/NaviProj/navi-llm.git", branch = "main", optional = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
