@@ -4,6 +4,7 @@
 //!
 //! 由于 llama-cpp-2 的 LlamaContext 不是 Send 的，本模块使用专用线程运行推理，
 //! 通过 channel 与 async 世界通信。
+use crate::llm::think_tag::{ThinkTagEvent, ThinkTagParser};
 use crate::llm::traits::{ChatClient, ChatDelta};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -39,89 +40,40 @@ impl ChatClient for LocalLMClient {
 
         // Spawn the worker interaction task
         tokio::spawn(async move {
-            let state = std::sync::Arc::new(std::sync::Mutex::new((false, String::new())));
+            let parser = std::sync::Arc::new(std::sync::Mutex::new(
+                ThinkTagParser::new(enable_thinking, false),
+            ));
 
-            let flush_buffer =
-                move |in_think: &mut bool,
-                      buffer: &mut String,
-                      is_end: bool,
-                      tx: &tokio::sync::mpsc::UnboundedSender<Result<ChatDelta>>| {
-                    loop {
-                        if *in_think {
-                            if let Some(pos) = buffer.find("</think>") {
-                                let before = &buffer[..pos];
-                                if enable_thinking && !before.is_empty() {
-                                    let _ = tx.send(Ok(ChatDelta::Thinking(before.to_string())));
-                                }
-                                *in_think = false;
-                                let mut after = buffer[pos + 8..].to_string();
-                                if after.starts_with('\n') {
-                                    after = after[1..].to_string();
-                                }
-                                *buffer = after;
-                            } else if is_end {
-                                if enable_thinking && !buffer.is_empty() {
-                                    let _ = tx.send(Ok(ChatDelta::Thinking(buffer.to_string())));
-                                }
-                                buffer.clear();
-                                break;
-                            } else {
-                                let safe_len = buffer.floor_char_boundary(buffer.len().saturating_sub(8));
-                                if safe_len > 0 {
-                                    let chunk = buffer[..safe_len].to_string();
-                                    if enable_thinking {
-                                        let _ = tx.send(Ok(ChatDelta::Thinking(chunk)));
-                                    }
-                                    buffer.drain(..safe_len);
-                                }
-                                break;
-                            }
-                        } else {
-                            if let Some(pos) = buffer.find("<think>") {
-                                let before = &buffer[..pos];
-                                if !before.is_empty() {
-                                    let _ = tx.send(Ok(ChatDelta::Text(before.to_string())));
-                                }
-                                *in_think = true;
-                                let mut after = buffer[pos + 7..].to_string();
-                                if after.starts_with('\n') {
-                                    after = after[1..].to_string();
-                                }
-                                *buffer = after;
-                            } else if is_end {
-                                if !buffer.is_empty() {
-                                    let _ = tx.send(Ok(ChatDelta::Text(buffer.to_string())));
-                                }
-                                buffer.clear();
-                                break;
-                            } else {
-                                let safe_len = buffer.floor_char_boundary(buffer.len().saturating_sub(7));
-                                if safe_len > 0 {
-                                    let chunk = buffer[..safe_len].to_string();
-                                    let _ = tx.send(Ok(ChatDelta::Text(chunk)));
-                                    buffer.drain(..safe_len);
-                                }
-                                break;
-                            }
+            fn send_events(
+                events: Vec<ThinkTagEvent>,
+                tx: &tokio::sync::mpsc::UnboundedSender<Result<ChatDelta>>,
+            ) {
+                for event in events {
+                    match event {
+                        ThinkTagEvent::Text(t) => {
+                            let _ = tx.send(Ok(ChatDelta::Text(t)));
+                        }
+                        ThinkTagEvent::Thinking(t) => {
+                            let _ = tx.send(Ok(ChatDelta::Thinking(t)));
                         }
                     }
-                };
+                }
+            }
 
-            let state_clone = state.clone();
+            let parser_clone = parser.clone();
             let tx_callback = tx_clone.clone();
             let res = client
                 .chat_streaming(message, image_bytes, move |token| {
-                    let mut lock = state_clone.lock().unwrap();
-                    let (in_think, buffer) = &mut *lock;
-                    buffer.push_str(token);
-                    flush_buffer(in_think, buffer, false, &tx_callback);
+                    let mut p = parser_clone.lock().unwrap();
+                    let events = p.push(token);
+                    send_events(events, &tx_callback);
                 })
                 .await;
 
             // Final flush
-            let mut lock = state.lock().unwrap();
-            let (in_think, buffer) = &mut *lock;
-            flush_buffer(in_think, buffer, true, &tx_clone);
+            let mut p = parser.lock().unwrap();
+            let events = p.flush();
+            send_events(events, &tx_clone);
 
             if let Err(e) = res {
                 let _ = tx.send(Err(anyhow::anyhow!(e)));

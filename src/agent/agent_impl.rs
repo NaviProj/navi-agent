@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -17,6 +18,10 @@ use crate::tool::registry::ToolRegistry;
 /// It wraps the stateless `agent_loop` with persistent state: conversation history,
 /// tool registry, context pipeline, and configuration. Each call to `prompt()` or
 /// `prompt_with_cancel()` kicks off a new agent turn cycle.
+///
+/// **Note**: `prompt()` must not be called concurrently. Each call replaces the
+/// internal cancel/control handles. If you need concurrent agents, create separate
+/// `NaviAgent` instances.
 pub struct NaviAgent {
     config: AgentLoopConfig,
     llm_client: Arc<dyn LlmClient>,
@@ -26,6 +31,7 @@ pub struct NaviAgent {
     middlewares: Vec<Arc<dyn ToolMiddleware>>,
     cancel: Option<CancellationToken>,
     control_tx: Option<ControlSender>,
+    running: Arc<AtomicBool>,
 }
 
 impl NaviAgent {
@@ -47,6 +53,7 @@ impl NaviAgent {
             middlewares,
             cancel: None,
             control_tx: None,
+            running: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -54,14 +61,28 @@ impl NaviAgent {
     ///
     /// Returns an `AgentEventStream` for real-time event consumption.
     /// The conversation history is automatically maintained across calls.
-    pub fn prompt(&mut self, input: impl Into<String>) -> AgentEventStream {
+    ///
+    /// # Errors
+    /// Returns `AgentError::AlreadyStreaming` if a previous prompt is still running.
+    pub fn prompt(&mut self, input: impl Into<String>) -> Result<AgentEventStream, AgentError> {
+        if self.running.load(Ordering::SeqCst) {
+            return Err(AgentError::AlreadyStreaming);
+        }
+        self.running.store(true, Ordering::SeqCst);
+
+        // Cancel any stale previous loop (safety net)
+        if let Some(prev_cancel) = self.cancel.take() {
+            prev_cancel.cancel();
+        }
+
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
 
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_BUFFER);
         self.control_tx = Some(control_tx);
 
-        agent_loop(
+        let running = self.running.clone();
+        let stream = agent_loop(
             self.config.clone(),
             self.llm_client.clone(),
             self.tool_registry.clone(),
@@ -71,21 +92,48 @@ impl NaviAgent {
             input.into(),
             cancel,
             Some(control_rx),
-        )
+        );
+
+        // Spawn a watcher that clears the running flag when the loop task ends.
+        // The agent_loop spawns a background task and returns a stream; the stream
+        // is backed by an mpsc channel that closes when the task finishes. We rely
+        // on abort() / natural completion to clear the flag via this task.
+        let running_clone = running;
+        let cancel_clone = self.cancel.as_ref().unwrap().clone();
+        tokio::spawn(async move {
+            cancel_clone.cancelled().await;
+            running_clone.store(false, Ordering::SeqCst);
+        });
+
+        Ok(stream)
     }
 
     /// Start a new agent cycle with an external cancellation token.
+    ///
+    /// # Errors
+    /// Returns `AgentError::AlreadyStreaming` if a previous prompt is still running.
     pub fn prompt_with_cancel(
         &mut self,
         input: impl Into<String>,
         cancel: CancellationToken,
-    ) -> AgentEventStream {
+    ) -> Result<AgentEventStream, AgentError> {
+        if self.running.load(Ordering::SeqCst) {
+            return Err(AgentError::AlreadyStreaming);
+        }
+        self.running.store(true, Ordering::SeqCst);
+
+        // Cancel any stale previous loop
+        if let Some(prev_cancel) = self.cancel.take() {
+            prev_cancel.cancel();
+        }
+
         self.cancel = Some(cancel.clone());
 
         let (control_tx, control_rx) = mpsc::channel(CONTROL_CHANNEL_BUFFER);
         self.control_tx = Some(control_tx);
 
-        agent_loop(
+        let running = self.running.clone();
+        let stream = agent_loop(
             self.config.clone(),
             self.llm_client.clone(),
             self.tool_registry.clone(),
@@ -93,9 +141,17 @@ impl NaviAgent {
             self.context_store.clone(),
             self.middlewares.clone(),
             input.into(),
-            cancel,
+            cancel.clone(),
             Some(control_rx),
-        )
+        );
+
+        let running_clone = running;
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            running_clone.store(false, Ordering::SeqCst);
+        });
+
+        Ok(stream)
     }
 
     /// Send a steering message to the running agent.

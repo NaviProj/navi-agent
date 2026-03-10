@@ -45,6 +45,7 @@ pub struct APIChatClient {
     format: APIFormat,
     auth: AuthMethod,
     thinking: Option<bool>,
+    max_tokens: Option<u32>,
 }
 
 impl APIChatClient {
@@ -116,12 +117,19 @@ impl APIChatClient {
             format,
             auth,
             thinking,
+            max_tokens: None,
         }
     }
 
     /// Set whether to enable the 'thinking' parameter
     pub fn set_enable_thinking(&mut self, enabled: bool) {
         self.thinking = Some(enabled);
+    }
+
+    /// Set max_tokens for the LLM response. Particularly important for Anthropic
+    /// which requires it in the request body.
+    pub fn set_max_tokens(&mut self, max_tokens: u32) {
+        self.max_tokens = Some(max_tokens);
     }
 
     /// Detect format from api_base / model name (backward compat helper).
@@ -159,7 +167,13 @@ impl APIChatClient {
         match self.format {
             APIFormat::OpenAIChat => Box::new(OpenAIChatSerializer),
             APIFormat::OpenAIResponses => Box::new(OpenAIResponsesSerializer),
-            APIFormat::Anthropic => Box::new(AnthropicSerializer),
+            APIFormat::Anthropic => {
+                let mut s = AnthropicSerializer::default();
+                if let Some(mt) = self.max_tokens {
+                    s.max_tokens = mt;
+                }
+                Box::new(s)
+            }
         }
     }
 

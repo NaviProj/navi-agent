@@ -270,67 +270,73 @@ impl NaviTool for GlobTool {
         let p: GlobParams = serde_json::from_value(params)
             .map_err(|e| AgentError::ToolExecutionFailed(format!("Invalid params: {}", e)))?;
 
-        let base_path = p.path.unwrap_or_else(|| ".".to_string());
+        // File walking and sorting are blocking I/O — run off the async runtime.
+        let result = tokio::task::spawn_blocking(move || {
+            let base_path = p.path.unwrap_or_else(|| ".".to_string());
 
-        let mut override_builder = OverrideBuilder::new(&base_path);
-        let glob_pattern = if p.pat.contains('/') {
-            p.pat.clone()
-        } else {
-            format!("**/{}", p.pat)
-        };
+            let mut override_builder = OverrideBuilder::new(&base_path);
+            let glob_pattern = if p.pat.contains('/') {
+                p.pat.clone()
+            } else {
+                format!("**/{}", p.pat)
+            };
 
-        if let Err(e) = override_builder.add(&glob_pattern) {
-            return Ok(ToolResult {
-                content: format!("Invalid glob pattern: {}", e),
-                is_error: true,
-                details: Value::Null,
-            });
-        }
-        let overrides = override_builder
-            .build()
-            .unwrap_or_else(|_| ignore::overrides::Override::empty());
+            if let Err(e) = override_builder.add(&glob_pattern) {
+                return ToolResult {
+                    content: format!("Invalid glob pattern: {}", e),
+                    is_error: true,
+                    details: Value::Null,
+                };
+            }
+            let overrides = override_builder
+                .build()
+                .unwrap_or_else(|_| ignore::overrides::Override::empty());
 
-        let walker = WalkBuilder::new(&base_path)
-            .standard_filters(true) // follows .gitignore
-            .hidden(true) // hides .git, .env, etc
-            .overrides(overrides)
-            .build();
+            let walker = WalkBuilder::new(&base_path)
+                .standard_filters(true)
+                .hidden(true)
+                .overrides(overrides)
+                .build();
 
-        let mut files = Vec::new();
-        for result in walker {
-            if let Ok(entry) = result {
-                if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    files.push(entry.path().to_path_buf());
+            let mut files = Vec::new();
+            for result in walker {
+                if let Ok(entry) = result {
+                    if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                        files.push(entry.path().to_path_buf());
+                    }
                 }
             }
-        }
 
-        // Sort by mtime, descending
-        files.sort_by(|a, b| {
-            let time_a = std::fs::metadata(a)
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            let time_b = std::fs::metadata(b)
-                .and_then(|m| m.modified())
-                .unwrap_or(SystemTime::UNIX_EPOCH);
-            time_b.cmp(&time_a) // reverse order
-        });
+            files.sort_by(|a, b| {
+                let time_a = std::fs::metadata(a)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                let time_b = std::fs::metadata(b)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                time_b.cmp(&time_a)
+            });
 
-        let file_strs: Vec<String> = files
-            .into_iter()
-            .map(|f| f.to_string_lossy().into_owned())
-            .collect();
-        let content = if file_strs.is_empty() {
-            "none".to_string()
-        } else {
-            file_strs.join("\n")
-        };
+            let file_strs: Vec<String> = files
+                .into_iter()
+                .map(|f| f.to_string_lossy().into_owned())
+                .collect();
+            let content = if file_strs.is_empty() {
+                "none".to_string()
+            } else {
+                file_strs.join("\n")
+            };
 
-        Ok(ToolResult {
-            content,
-            is_error: false,
-            details: Value::Null,
+            ToolResult {
+                content,
+                is_error: false,
+                details: Value::Null,
+            }
         })
+        .await
+        .map_err(|e| AgentError::ToolExecutionFailed(format!("Glob task panicked: {}", e)))?;
+
+        Ok(result)
     }
 }
 
@@ -376,7 +382,7 @@ impl NaviTool for GrepTool {
         let p: GrepParams = serde_json::from_value(params)
             .map_err(|e| AgentError::ToolExecutionFailed(format!("Invalid params: {}", e)))?;
 
-        // Compile regex
+        // Compile regex before spawning to return errors quickly
         let re = match Regex::new(&p.pat) {
             Ok(r) => r,
             Err(e) => {
@@ -388,40 +394,52 @@ impl NaviTool for GrepTool {
             }
         };
 
-        let base_path = p.path.unwrap_or_else(|| ".".to_string());
+        // File walking and reading are blocking I/O — run off the async runtime.
+        let result = tokio::task::spawn_blocking(move || {
+            let base_path = p.path.unwrap_or_else(|| ".".to_string());
 
-        let walker = WalkBuilder::new(&base_path)
-            .standard_filters(true)
-            .hidden(true)
-            .build();
+            let walker = WalkBuilder::new(&base_path)
+                .standard_filters(true)
+                .hidden(true)
+                .build();
 
-        let mut hits = Vec::new();
-        for result in walker {
-            if let Ok(entry) = result {
-                if entry.file_type().map_or(false, |ft| ft.is_file()) {
-                    let path = entry.path();
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        for (line_num, line) in content.lines().enumerate() {
-                            if re.is_match(line) {
-                                hits.push(format!("{}:{}:{}", path.display(), line_num + 1, line));
+            let mut hits = Vec::new();
+            for result in walker {
+                if let Ok(entry) = result {
+                    if entry.file_type().map_or(false, |ft| ft.is_file()) {
+                        let path = entry.path();
+                        if let Ok(content) = std::fs::read_to_string(path) {
+                            for (line_num, line) in content.lines().enumerate() {
+                                if re.is_match(line) {
+                                    hits.push(format!(
+                                        "{}:{}:{}",
+                                        path.display(),
+                                        line_num + 1,
+                                        line
+                                    ));
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        let content = if hits.is_empty() {
-            "none".to_string()
-        } else {
-            hits.iter().take(50).cloned().collect::<Vec<_>>().join("\n")
-        };
+            let content = if hits.is_empty() {
+                "none".to_string()
+            } else {
+                hits.iter().take(50).cloned().collect::<Vec<_>>().join("\n")
+            };
 
-        Ok(ToolResult {
-            content,
-            is_error: false,
-            details: Value::Null,
+            ToolResult {
+                content,
+                is_error: false,
+                details: Value::Null,
+            }
         })
+        .await
+        .map_err(|e| AgentError::ToolExecutionFailed(format!("Grep task panicked: {}", e)))?;
+
+        Ok(result)
     }
 }
 

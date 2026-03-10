@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     println!("─────────────────────────────────");
 
     // Start the agent loop and consume events
-    let mut stream = agent.prompt(&instruction);
+    let mut stream = agent.prompt(&instruction).expect("Failed to start agent prompt");
 
     while let Some(event) = stream.next().await {
         match event {

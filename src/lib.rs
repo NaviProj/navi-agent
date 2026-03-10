@@ -12,15 +12,20 @@ pub mod multiplexer;
 
 use anyhow::Result;
 use executor::{AgentExecutor, LocalExecutor};
-pub use multiplexer::{AgentEvent, OutputMultiplexer};
 use tokio::sync::mpsc;
 
 pub use agents::schedule::create_schedule_navi_agent;
 pub use agents::task::create_task_navi_agent;
 
+// ─── Legacy Re-exports ───
+// `AgentEvent` here is the legacy multiplexer event used by navi-bot's AgentManager.
+// For the new agent framework event type, use `NewAgentEvent` (= `core::event::AgentEvent`).
+// Once navi-bot is fully migrated to the new architecture, these should be consolidated.
+pub use multiplexer::{AgentEvent, OutputMultiplexer};
+
 // ─── New Architecture Re-exports ───
 
-// Core types
+// Core types — `NewAgentEvent` is the new architecture's event type
 pub use core::event::AgentEvent as NewAgentEvent;
 pub use core::{AgentError, AgentState, NaviMessage};
 

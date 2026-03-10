@@ -165,7 +165,13 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        let mut stream = agent.prompt(input);
+        let mut stream = match agent.prompt(input) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                continue;
+            }
+        };
 
         // Track accumulated text for printing chunks nicely (if needed)
         let mut is_first_text = true;

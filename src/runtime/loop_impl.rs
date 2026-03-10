@@ -111,6 +111,7 @@ async fn run_loop(
 
     info!(turns = config.max_turns, "Agent loop started");
 
+    let mut completed_naturally = false;
     for turn in 0..config.max_turns {
         if cancel.is_cancelled() {
             return Err(AgentError::Aborted);
@@ -342,6 +343,7 @@ async fn run_loop(
                     messages.extend(tool_results);
 
                     // Break out — graceful cancel
+                    completed_naturally = true;
                     break;
                 }
             }
@@ -356,7 +358,22 @@ async fn run_loop(
             .await;
 
         debug!(turn, "Agent loop completed - final response received");
+        completed_naturally = true;
         break;
+    }
+
+    if !completed_naturally {
+        // for-loop exhausted without a natural break — max_turns reached
+        error!(
+            max_turns = config.max_turns,
+            "Agent loop exhausted max_turns without reaching a final response"
+        );
+        let _ = event_tx
+            .send(AgentEvent::Error(format!(
+                "Max turns ({}) exhausted without final response",
+                config.max_turns
+            )))
+            .await;
     }
 
     // Save state before finishing

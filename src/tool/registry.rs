@@ -1,4 +1,5 @@
 use super::traits::NaviTool;
+use crate::core::error::AgentError;
 use crate::llm::serializer::ToolDef;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -18,33 +19,65 @@ impl ToolRegistry {
         Self::default()
     }
 
+    fn read_tools(
+        &self,
+    ) -> Result<std::sync::RwLockReadGuard<'_, HashMap<String, Arc<dyn NaviTool>>>, AgentError> {
+        self.tools.read().map_err(|_| {
+            AgentError::Other(anyhow::anyhow!(
+                "ToolRegistry RwLock poisoned (a thread panicked while holding the lock)"
+            ))
+        })
+    }
+
+    fn write_tools(
+        &self,
+    ) -> Result<std::sync::RwLockWriteGuard<'_, HashMap<String, Arc<dyn NaviTool>>>, AgentError>
+    {
+        self.tools.write().map_err(|_| {
+            AgentError::Other(anyhow::anyhow!(
+                "ToolRegistry RwLock poisoned (a thread panicked while holding the lock)"
+            ))
+        })
+    }
+
     /// Register a tool. If a tool with the same name already exists, it is replaced.
     pub fn register(&self, tool: impl NaviTool + 'static) {
-        self.tools
-            .write()
-            .unwrap()
-            .insert(tool.name().to_string(), Arc::new(tool));
+        if let Ok(mut guard) = self.write_tools() {
+            guard.insert(tool.name().to_string(), Arc::new(tool));
+        } else {
+            tracing::error!("Failed to register tool: ToolRegistry lock poisoned");
+        }
     }
 
     /// Unregister a tool by name. Returns true if the tool was found and removed.
     pub fn unregister(&self, name: &str) -> bool {
-        self.tools.write().unwrap().remove(name).is_some()
+        match self.write_tools() {
+            Ok(mut guard) => guard.remove(name).is_some(),
+            Err(_) => {
+                tracing::error!("Failed to unregister tool: ToolRegistry lock poisoned");
+                false
+            }
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn NaviTool>> {
-        self.tools.read().unwrap().get(name).cloned()
+        self.read_tools().ok()?.get(name).cloned()
     }
 
     pub fn definitions(&self) -> Vec<ToolDef> {
-        self.tools
-            .read()
-            .unwrap()
-            .values()
-            .map(|t| ToolDef {
-                name: t.name().to_string(),
-                description: t.description().to_string(),
-                parameters: t.parameters_schema(),
-            })
-            .collect()
+        match self.read_tools() {
+            Ok(guard) => guard
+                .values()
+                .map(|t| ToolDef {
+                    name: t.name().to_string(),
+                    description: t.description().to_string(),
+                    parameters: t.parameters_schema(),
+                })
+                .collect(),
+            Err(_) => {
+                tracing::error!("Failed to read tool definitions: ToolRegistry lock poisoned");
+                Vec::new()
+            }
+        }
     }
 }

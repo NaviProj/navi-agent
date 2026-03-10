@@ -8,6 +8,7 @@ use crate::core::error::AgentError;
 use crate::core::event::MessageDelta;
 use crate::core::message::{ContentBlock, MessageRole, NaviMessage};
 use crate::llm::serializer::ToolDef;
+use crate::llm::think_tag::{ThinkTagEvent, ThinkTagParser};
 use crate::runtime::llm_client::{LlmClient, LlmStream};
 use async_trait::async_trait;
 use navi_llm::{LlmConfig, LlmSessionFactory};
@@ -27,6 +28,7 @@ pub struct LocalLlmAgentClient {
     /// Optional overrides for session creation (allows sharing a factory with different session params)
     ctx_size_override: Option<u32>,
     max_tokens_override: Option<u32>,
+    kv_cache_q8_override: Option<bool>,
 }
 
 #[derive(Default)]
@@ -53,6 +55,7 @@ impl LocalLlmAgentClient {
             caller_managed_context,
             ctx_size_override: None,
             max_tokens_override: None,
+            kv_cache_q8_override: None,
         })
     }
 
@@ -67,12 +70,13 @@ impl LocalLlmAgentClient {
             caller_managed_context,
             ctx_size_override: None,
             max_tokens_override: None,
+            kv_cache_q8_override: None,
         }
     }
 
     /// Create from a shared factory with custom session parameters.
     ///
-    /// This allows reusing a loaded model while overriding ctx_size and max_tokens
+    /// This allows reusing a loaded model while overriding ctx_size, max_tokens, and kv_cache_q8
     /// for sessions created by this client.
     pub fn from_factory_with_options(
         factory: Arc<LlmSessionFactory>,
@@ -80,6 +84,7 @@ impl LocalLlmAgentClient {
         caller_managed_context: bool,
         ctx_size: Option<u32>,
         max_tokens: Option<u32>,
+        kv_cache_q8: Option<bool>,
     ) -> Self {
         Self {
             factory,
@@ -87,6 +92,7 @@ impl LocalLlmAgentClient {
             caller_managed_context,
             ctx_size_override: ctx_size,
             max_tokens_override: max_tokens,
+            kv_cache_q8_override: kv_cache_q8,
         }
     }
 }
@@ -203,6 +209,7 @@ impl LlmClient for LocalLlmAgentClient {
         let caller_managed_context = self.caller_managed_context;
         let ctx_size_override = self.ctx_size_override;
         let max_tokens_override = self.max_tokens_override;
+        let kv_cache_q8_override = self.kv_cache_q8_override;
 
         let mut chat_history = Vec::new();
         for msg in messages {
@@ -223,9 +230,11 @@ impl LlmClient for LocalLlmAgentClient {
             let cfg = factory.config();
             let ctx_size = ctx_size_override.unwrap_or(cfg.ctx_size.get());
             let max_tokens = max_tokens_override.unwrap_or(cfg.max_tokens);
-            let mut session = match factory.create_session_with_options(
+            let mut session = match factory.create_session_with_full_options(
                 Some(ctx_size),
                 Some(max_tokens),
+                kv_cache_q8_override,
+                Some(enable_thinking),
             ) {
                 Ok(s) => s,
                 Err(e) => {
@@ -264,84 +273,31 @@ impl LlmClient for LocalLlmAgentClient {
             let cancel_flag = Arc::new(AtomicBool::new(false));
             session.set_cancel(Some(cancel_flag.clone()));
 
-            let mut in_think = false;
-            let mut buffer = String::new();
+            // When enable_thinking=true, check if the template forces a thinking block open.
+            // If so, the model output starts inside <think> (already in the prompt),
+            // meaning generated tokens are thinking content from the first token.
+            let thinking_forced = enable_thinking && session.thinking_forced_open();
             let delta_tx_clone = delta_tx.clone();
             let mut fallback_tool_id: u64 = 0;
             let mut pending_tool_calls: BTreeMap<usize, PendingToolCall> = BTreeMap::new();
+            let mut think_parser = ThinkTagParser::new(enable_thinking, thinking_forced);
 
-            let flush_buffer = |in_think: &mut bool,
-                                buffer: &mut String,
-                                is_end: bool,
-                                tx: &tokio::sync::mpsc::UnboundedSender<
-                Result<MessageDelta, AgentError>,
-            >| {
-                loop {
-                    if *in_think {
-                        if let Some(pos) = buffer.find("</think>") {
-                            let before = &buffer[..pos];
-                            if enable_thinking && !before.is_empty() {
-                                let _ = tx.send(Ok(MessageDelta::Thinking(before.to_string())));
-                            }
-                            *in_think = false;
-                            let mut after = buffer[pos + 8..].to_string();
-                            if after.starts_with('\n') {
-                                after = after[1..].to_string();
-                            }
-                            *buffer = after;
-                        } else if is_end {
-                            if enable_thinking && !buffer.is_empty() {
-                                let _ = tx.send(Ok(MessageDelta::Thinking(buffer.to_string())));
-                            }
-                            buffer.clear();
-                            break;
-                        } else {
-                            let mut safe_len = buffer.len().saturating_sub(8);
-                            while safe_len > 0 && !buffer.is_char_boundary(safe_len) {
-                                safe_len -= 1;
-                            }
-                            if safe_len > 0 {
-                                let chunk = buffer[..safe_len].to_string();
-                                if enable_thinking {
-                                    let _ = tx.send(Ok(MessageDelta::Thinking(chunk)));
-                                }
-                                buffer.drain(..safe_len);
-                            }
-                            break;
+            /// Send ThinkTagEvents as MessageDeltas.
+            fn send_think_events(
+                events: Vec<ThinkTagEvent>,
+                tx: &tokio::sync::mpsc::UnboundedSender<Result<MessageDelta, AgentError>>,
+            ) {
+                for event in events {
+                    match event {
+                        ThinkTagEvent::Text(t) => {
+                            let _ = tx.send(Ok(MessageDelta::Text(t)));
                         }
-                    } else {
-                        if let Some(pos) = buffer.find("<think>") {
-                            let before = &buffer[..pos];
-                            if !before.is_empty() {
-                                let _ = tx.send(Ok(MessageDelta::Text(before.to_string())));
-                            }
-                            *in_think = true;
-                            let mut after = buffer[pos + 7..].to_string();
-                            if after.starts_with('\n') {
-                                after = after[1..].to_string();
-                            }
-                            *buffer = after;
-                        } else if is_end {
-                            if !buffer.is_empty() {
-                                let _ = tx.send(Ok(MessageDelta::Text(buffer.to_string())));
-                            }
-                            buffer.clear();
-                            break;
-                        } else {
-                            let mut safe_len = buffer.len().saturating_sub(7);
-                            while safe_len > 0 && !buffer.is_char_boundary(safe_len) {
-                                safe_len -= 1;
-                            }
-                            if safe_len > 0 {
-                                let chunk = buffer[..safe_len].to_string();
-                                let _ = tx.send(Ok(MessageDelta::Text(chunk)));
-                                buffer.drain(..safe_len);
-                            }
-                            break;
+                        ThinkTagEvent::Thinking(t) => {
+                            let _ = tx.send(Ok(MessageDelta::Thinking(t)));
                         }
                     }
                 }
-            };
+            }
 
             let send_delta_from_json = |val: &Value,
                                         fallback_tool_id: &mut u64,
@@ -426,13 +382,25 @@ impl LlmClient for LocalLlmAgentClient {
                     }
                 }
 
-                if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
-                    if !content.is_empty() {
-                        let _ = tx.send(Ok(MessageDelta::Text(content.to_string())));
-                    }
-                }
+                // NOTE: content is NOT sent here. It is routed through the buffer
+                // in the callback to properly handle <think>/<\/think> tags when
+                // enable_thinking is active.
 
                 true
+            };
+
+            // Extract content text from a JSON delta (handles both SSE-wrapped and direct formats).
+            let extract_content = |val: &Value| -> Option<String> {
+                let delta = val
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("delta"))
+                    .unwrap_or(val);
+                delta
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
             };
 
             let result = session.complete_chat_streaming(|chunk| {
@@ -451,6 +419,11 @@ impl LlmClient for LocalLlmAgentClient {
                             &mut pending_tool_calls,
                             &delta_tx_clone,
                         ) {
+                            // Route content through think-tag parser
+                            if let Some(content) = extract_content(&val) {
+                                let events = think_parser.push(&content);
+                                send_think_events(events, &delta_tx_clone);
+                            }
                             return;
                         }
                     }
@@ -463,6 +436,11 @@ impl LlmClient for LocalLlmAgentClient {
                         &mut pending_tool_calls,
                         &delta_tx_clone,
                     ) {
+                        // Route content through think-tag parser
+                        if let Some(content) = extract_content(&val) {
+                            let events = think_parser.push(&content);
+                            send_think_events(events, &delta_tx_clone);
+                        }
                         return;
                     }
                 }
@@ -475,13 +453,18 @@ impl LlmClient for LocalLlmAgentClient {
                             &mut pending_tool_calls,
                             &delta_tx_clone,
                         ) {
+                            // Route content through think-tag parser
+                            if let Some(content) = extract_content(&val) {
+                                let events = think_parser.push(&content);
+                                send_think_events(events, &delta_tx_clone);
+                            }
                             return;
                         }
                     }
                 }
 
-                buffer.push_str(chunk);
-                flush_buffer(&mut in_think, &mut buffer, false, &delta_tx_clone);
+                let events = think_parser.push(chunk);
+                send_think_events(events, &delta_tx_clone);
             });
 
             if result.is_ok() {
@@ -508,7 +491,8 @@ impl LlmClient for LocalLlmAgentClient {
                 }
             }
 
-            flush_buffer(&mut in_think, &mut buffer, true, &delta_tx_clone);
+            let final_events = think_parser.flush();
+            send_think_events(final_events, &delta_tx_clone);
 
             if let Err(e) = result {
                 let _ = delta_tx.send(Err(AgentError::LlmError(format!(

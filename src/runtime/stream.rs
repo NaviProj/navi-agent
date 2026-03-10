@@ -1,4 +1,6 @@
 use crate::core::event::AgentEvent;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
 pub struct AgentEventStream {
@@ -12,6 +14,14 @@ impl AgentEventStream {
 
     pub async fn next(&mut self) -> Option<AgentEvent> {
         self.rx.recv().await
+    }
+}
+
+impl futures_util::Stream for AgentEventStream {
+    type Item = AgentEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rx.poll_recv(cx)
     }
 }
 

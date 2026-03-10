@@ -144,11 +144,18 @@ impl MessageSerializer for OpenAIResponsesSerializer {
 
 // ─── Parser ───
 
-pub struct OpenAIResponsesParser;
+pub struct OpenAIResponsesParser {
+    /// Maps item_id → call_id for function call items.
+    /// The Responses API uses `item_id` in argument delta events, but the actual
+    /// call_id (used for matching tool results) is set in `output_item.added`.
+    item_to_call_id: std::collections::HashMap<String, String>,
+}
 
 impl OpenAIResponsesParser {
     pub fn new() -> Self {
-        Self
+        Self {
+            item_to_call_id: std::collections::HashMap::new(),
+        }
     }
 }
 
@@ -184,6 +191,17 @@ impl ResponseParser for OpenAIResponsesParser {
                         .and_then(|c| c.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let item_id = item
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Store the mapping from item_id to call_id
+                    if !item_id.is_empty() && !call_id.is_empty() {
+                        self.item_to_call_id.insert(item_id, call_id.clone());
+                    }
+
                     Some(Ok(MessageDelta::ToolCall {
                         id: call_id,
                         name,
@@ -194,11 +212,17 @@ impl ResponseParser for OpenAIResponsesParser {
                 }
             }
             "response.function_call_arguments.delta" => {
-                let call_id = parsed
+                let item_id = parsed
                     .get("item_id")
                     .and_then(|c| c.as_str())
                     .unwrap_or("")
                     .to_string();
+                // Resolve item_id → call_id; fall back to item_id if not found
+                let call_id = self
+                    .item_to_call_id
+                    .get(&item_id)
+                    .cloned()
+                    .unwrap_or(item_id);
                 let delta = parsed
                     .get("delta")
                     .and_then(|d| d.as_str())

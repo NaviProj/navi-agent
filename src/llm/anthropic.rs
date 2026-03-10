@@ -8,7 +8,15 @@ use serde_json::{json, Value};
 
 // ─── Serializer ───
 
-pub struct AnthropicSerializer;
+pub struct AnthropicSerializer {
+    pub max_tokens: u32,
+}
+
+impl Default for AnthropicSerializer {
+    fn default() -> Self {
+        Self { max_tokens: 4096 }
+    }
+}
 
 impl AnthropicSerializer {
     /// Merge consecutive messages with the same role (Anthropic requirement).
@@ -39,7 +47,7 @@ impl MessageSerializer for AnthropicSerializer {
         messages: &[NaviMessage],
         tools: &[ToolDef],
         stream: bool,
-        _thinking: Option<bool>,
+        thinking: Option<bool>,
     ) -> Value {
         let mut raw_messages = Vec::new();
 
@@ -134,12 +142,25 @@ impl MessageSerializer for AnthropicSerializer {
 
         let merged = Self::merge_consecutive_roles(raw_messages);
 
+        let max_tokens = self.max_tokens;
+
         let mut payload = json!({
             "model": model,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "messages": merged,
             "stream": stream,
         });
+
+        // Enable extended thinking if requested
+        if thinking == Some(true) {
+            // When thinking is enabled, budget_tokens should be less than max_tokens.
+            // Use 80% of max_tokens as thinking budget, minimum 1024.
+            let budget = std::cmp::max(1024, (max_tokens as u64 * 4 / 5) as u32);
+            payload["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget
+            });
+        }
 
         if let Some(sp) = system_prompt {
             payload["system"] = json!(sp);

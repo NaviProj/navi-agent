@@ -13,6 +13,7 @@ pub mod openai_chat;
 pub mod openai_responses;
 pub mod parser;
 pub mod serializer;
+pub mod think_tag;
 
 pub use api_client::{APIChatClient, APIFormat};
 #[cfg(feature = "local-llm")]
