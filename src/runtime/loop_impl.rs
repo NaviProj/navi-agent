@@ -179,15 +179,28 @@ async fn run_loop(
                             if let Some(prev_id) = &current_tc_id {
                                 if prev_id != id && !id.is_empty() {
                                     // Finalize previous tool call
-                                    let args_value: serde_json::Value = serde_json::from_str(
+                                    match serde_json::from_str::<serde_json::Value>(
                                         &current_tc_args,
-                                    )
-                                    .unwrap_or(serde_json::Value::String(current_tc_args.clone()));
-                                    tool_calls.push((
-                                        prev_id.clone(),
-                                        current_tc_name.take().unwrap_or_default(),
-                                        args_value,
-                                    ));
+                                    ) {
+                                        Ok(args_value) => {
+                                            tool_calls.push((
+                                                prev_id.clone(),
+                                                current_tc_name
+                                                    .take()
+                                                    .unwrap_or_default(),
+                                                args_value,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            error!(
+                                                args = %current_tc_args,
+                                                error = %e,
+                                                tool = current_tc_name.as_deref().unwrap_or("unknown"),
+                                                "Dropping tool call with malformed JSON arguments"
+                                            );
+                                            current_tc_name.take();
+                                        }
+                                    }
                                     current_tc_args.clear();
                                 }
                             }
@@ -222,13 +235,23 @@ async fn run_loop(
 
         // Finalize the last pending tool call if any
         if let Some(tc_id) = current_tc_id.take() {
-            let args_value: serde_json::Value = serde_json::from_str(&current_tc_args)
-                .unwrap_or(serde_json::Value::String(current_tc_args.clone()));
-            tool_calls.push((
-                tc_id,
-                current_tc_name.take().unwrap_or_default(),
-                args_value,
-            ));
+            match serde_json::from_str::<serde_json::Value>(&current_tc_args) {
+                Ok(args_value) => {
+                    tool_calls.push((
+                        tc_id,
+                        current_tc_name.take().unwrap_or_default(),
+                        args_value,
+                    ));
+                }
+                Err(e) => {
+                    error!(
+                        args = %current_tc_args,
+                        error = %e,
+                        tool = current_tc_name.as_deref().unwrap_or("unknown"),
+                        "Dropping tool call with malformed JSON arguments"
+                    );
+                }
+            }
         }
 
         // Build the final assistant message
